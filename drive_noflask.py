@@ -10,7 +10,7 @@ import json
 CAMERA_HORIZONTAL = 0.5
 
 # --- CONFIGURATION ---
-MODEL_PATH = './model2.onnx'
+MODEL_PATH = './models/model2.onnx'
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CENTER_X = CAMERA_WIDTH * CAMERA_HORIZONTAL
@@ -23,15 +23,17 @@ ROI_VERTICAL_CUTOFF = 0.50
 Kp = 0.0008
 Kd = 0.0015
 BASE_SPEED = 0.3
+BOOST_SPEED = 0.27
+STEER_SLOW=0.5
 LANE_WIDTH_PIXELS = 450
 START_DELAY = 20
 SLOW_SPEED = 0.20
 NMS_IOU=0.7
 CONF = 0.20
-AR_TARGET = 0.5
+BOOST = False
 
 try:
-    with open("values_different.json", "r+") as fi:
+    with open("values.json", "r+") as fi:
         js = json.load(fi)
         TRIAL_COUNT = js.get("TrialCount", 0)
         NMS_IOU = js.get("Iou", 0.7)
@@ -40,10 +42,9 @@ try:
         ROI_VERTICAL_CUTOFF = js.get("CameraCutoff", 0.5)
         BASE_SPEED = js.get("BaseSpeed", 0.27)
         CONF = js.get("Conf", 0.2)
-        AR_TARGET = js.get("ArTarget", 0.7)
+        START_DELAY = js.get("StartDelay", 0)
         HORIZONTAL_OFFSET = js.get("HOffset", 0.5)
         SLOW_SPEED = js.get("SlowSpeed", 0.20)
-
 except:
         print("Loading Error, Ignoring")
 # STOP SIGN LOGIC
@@ -149,8 +150,8 @@ def robot_control_loop():
             boxes = result.boxes
             
             # --- VISION PROCESSING ---
-            best_y_ar = None
-            best_w_ar = None
+            best_y_x = None
+            best_w_x = None
             max_y_area = 0
             max_w_area = 0
             stop_requested = False
@@ -163,62 +164,81 @@ def robot_control_loop():
                 cls = model.names[int(box.cls[0])]
                 x, y, w, h = box.xywh[0].tolist()
                 
+                # Red Line Check
+                if cls == 'redline' and (STOP_AT_RED_LINE or BOOST):
+                    if y > BOOST_THRESHOLD_Y:
+                        speed = BOOST_SPEED
+
                 # Lane Check (Turn Later Logic)
                 cutoff_pixel = CAMERA_HEIGHT * ROI_VERTICAL_CUTOFF
                 if y < cutoff_pixel: 
                     continue
-               
-                wls = []
-
+                
                 area = w * h
                 if cls == 'yellowline' and area > max_y_area:
                     max_y_area = area
-                    best_y_ar = w/h
-                    best_y_box = (x, y, w, h)
+                    best_y_x = x
                 elif cls == 'whiteline' and area > max_w_area:
                     max_w_area = area
-                    best_w_ar = w/h
-                    wls.append((x, y, w, h))
+                    best_w_x = x
 
-
-                #if best_y_ar:
-                #    y_x, y_y, y_w, y_h = best_y_box
-                #    area = 0
-                #    max_w_area = 0
-                #    best_w_ar = None
-                #    for x, y, w, h in wls:
-                #        if y > (((y_y - y_w / 2) / (y_x - y_w / 2)) * (x - y_x)) + y_y: continue
-                #        area = w*h
-                #        if area > max_w_area:
-                #            max_w_area = area
-                #            best_w_area = w/h
-
+            # --- VIDEO FRAME UPDATE ---
+            # Generate the annotated frame for the web browser
+            annotated_frame = result.plot()
+            
             # --- CONTROL LOGIC ---
             
-            if best_w_ar and best_y_ar:
-                error = (best_y_ar - best_w_ar)
-            elif best_w_ar:
-                error = AR_TARGET - best_w_ar
-            elif best_y_ar:
-                error = best_y_ar - AR_TARGET
+            # 1. Execute Stop?
+            if stop_requested:
+                print("!!! STOPPING !!!")
+                stop_all()
+                
+                # Draw STOP text on frame
+                cv2.putText(annotated_frame, "STOPPING FOR LINE", (50, 240), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                
+                # Update global frame before sleeping so browser sees the message
+                
+                time.sleep(STOP_DURATION)
+                last_stop_time = time.time()
+                continue 
+
+            # 2. Calculate Target
+            if best_y_x is not None and best_w_x is not None:
+                target_x = (best_y_x + best_w_x) / 2
+            elif best_y_x is not None:
+                target_x = best_y_x + (LANE_WIDTH_PIXELS / 2)
+            elif best_w_x is not None:
+                target_x = best_w_x - (LANE_WIDTH_PIXELS / 2)
             else:
-                error = 0
-            #error = AR_TARGET - (best_w_ar if best_w_ar else -best_y_ar if best_y_ar else AR_TARGET)
+                target_x = target_x 
+            
+            # 3. PID
+            error = target_x - CENTER_X
             derivative = error - prev_error
             prev_error = error
-            steering = ((error * Kp) + (derivative * Kd))
+            steering = (error * Kp) + (derivative * Kd)
             
 	    # --- DEBUG TEXT OVERLAY ---
             debug_line = (
-                f"best_w_ar: {best_w_ar} | " +
-		        f"best_y_ar: {best_y_ar} | " +
-                f"steering: {steering:.4f}"
+                f"best_w_x: {best_w_x} | " +
+		        f"best_y_x: {best_y_x} | " +
+                f"target_x: {target_x:.1f} | " +
+                f"CENTER_X: {CENTER_X:.1f} | " +
+                f"error: {error:.1f} | " +
+                f"steering: {steering:.4f} | " +
+                f"speed: {speed:.2f}"
             )
+            #print(" " * len(debug_line), end="")
 
-            print(debug_line)
+            #print("\r", end="")
 
+            #print(debug_line, end="")
 
-            set_drive(BASE_SPEED if best_y_ar else SLOW_SPEED, steering)
+            if delay > 0: delay -= 1
+
+            set_drive(BASE_SPEED if best_y_x else SLOW_SPEED, steering if delay < 1 else 0)
+    
     except KeyboardInterrupt:
         print()
         print("Keyboard Interupted")
@@ -235,19 +255,7 @@ def robot_control_loop():
 # --- MAIN ENTRY POINT ---
 if __name__ == "__main__":
     while True:
-        inp = input((
-            f"Value to Change\n"
-            f"1) Kp: {Kp}\n" +
-            f"2) Kd: {Kd}\n" +
-            f"3) Target Aspect Ratio: {AR_TARGET}\n" +
-            f"4) Camera Cutoff: {ROI_VERTICAL_CUTOFF}\n" +
-            f"5) Base Speed: {BASE_SPEED}\n" +
-            f"6) Model Confidence: {CONF}\n" +
-            f"7) Horizontal Offset: {CAMERA_HORIZONTAL}\n" +
-            f"8) Slow Speed: {SLOW_SPEED}\n" +
-            f"9) Intersection Over Union: {NMS_IOU}\n" +
-            f"Press Enter to start Trial {TRIAL_COUNT + 1}\n" +
-            f">>] "))
+        inp = input(f"Value to Change \n1) Kp: {Kp}\n2) Kd: {Kd}\n3) Camera Cutoff: {ROI_VERTICAL_CUTOFF}\n4) Base Speed: {BASE_SPEED}\n5) Model Confidence: {CONF}\n6) Start Delay: {START_DELAY}\n7) Horizontal Offset: {CAMERA_HORIZONTAL}\n8) Slow Speed: {SLOW_SPEED}\n9) Intersection Over Union: {NMS_IOU}\nPress Enter to start Trial {TRIAL_COUNT + 1}\n>>] ")
         try:
             if inp.lower() == "1" or inp.lower() == "kp": 
                 num = float(input("Value: "))
@@ -255,18 +263,18 @@ if __name__ == "__main__":
             if inp.lower() == "2" or inp.lower() == "kd": 
                 num = float(input("Value: "))
                 Kd = num
-            if inp.lower() == "3":
-                num = float(input("Value: ")) 
-                AR_TARGET = num
-            if inp.lower() == "4": 
+            if inp.lower() == "3": 
                 num = float(input("Value: "))
                 ROI_VERTICAL_CUTOFF = num
-            if inp.lower() == "5": 
+            if inp.lower() == "4": 
                 num = float(input("Value: "))
                 BASE_SPEED = num
-            if inp.lower() == "6": 
+            if inp.lower() == "5": 
                 num = float(input("Value: "))
                 CONF = num
+            if inp.lower() == "6":
+                num = int(input("Value: "))
+                START_DELAY = num
             if inp.lower() == "7":
                 num = float(input("Value: "))
                 CAMERA_HORIZONTAL = num
@@ -281,7 +289,7 @@ if __name__ == "__main__":
                 robot_control_loop()
                 TRIAL_COUNT += 1
 
-            with open("values_different.json", "w+") as fi:
+            with open("values.json", "w+") as fi:
                 js = {
                     "TrialCount": TRIAL_COUNT,
                     "Kd": Kd,
@@ -289,7 +297,7 @@ if __name__ == "__main__":
                     "CameraCutoff": ROI_VERTICAL_CUTOFF,
                     "BaseSpeed": BASE_SPEED,
                     "Conf": CONF,
-                    "ArTarget": AR_TARGET,
+                    "StartDelay": START_DELAY,
                     "HOffset": CAMERA_HORIZONTAL,
                     "SlowSpeed": SLOW_SPEED,
                     "Iou": NMS_IOU

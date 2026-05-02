@@ -9,7 +9,7 @@ from adafruit_pca9685 import PCA9685
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
-MODEL_PATH = './model2.onnx'
+MODEL_PATH = './models/model2.onnx'
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CENTER_X = CAMERA_WIDTH / 2
