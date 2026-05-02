@@ -10,7 +10,7 @@ import json
 CAMERA_HORIZONTAL = 0.5
 
 # --- CONFIGURATION ---
-MODEL_PATH = './models/model2.onnx'
+MODEL_PATH = './Models/model2.onnx'
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CENTER_X = CAMERA_WIDTH * CAMERA_HORIZONTAL
