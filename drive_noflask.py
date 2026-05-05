@@ -5,15 +5,19 @@ import busio
 import threading
 from adafruit_pca9685 import PCA9685
 from ultralytics import YOLO
+from rknnlite.api import RKNNLite
 import json
+
 
 CAMERA_HORIZONTAL = 0.5
 
-# --- CONFIGURATION ---
-MODEL_PATH = './Models/model2.onnx'
+# --- CONFIGURATION --y
+MODEL_PATH = './models/rknn/model211_rknn_model'
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CENTER_X = CAMERA_WIDTH * CAMERA_HORIZONTAL
+
+target_PREV=CENTER_X
 
 STOP_AT_RED_LINE = False
 
@@ -54,7 +58,7 @@ BOOST_THRESHOLD_Y = CAMERA_HEIGHT * 0.8
 
 # MOTOR PHYSICS
 MIN_MOTOR_POWER = 0.07
-MAX_STEER = 0.8
+MAX_STEER = 1
 
 # --- Motor Class ---
 class Motor:
@@ -86,7 +90,9 @@ class Motor:
 
 # --- ROBOT LOGIC THREAD ---
 def robot_control_loop():
+    cv2.namedWindow("yolo")
     target_x = CENTER_X
+    target_PREV = CENTER_X
     # 1. Init Hardware
     try:
         i2c = busio.I2C(board.SCL, board.SDA)
@@ -212,12 +218,14 @@ def robot_control_loop():
                 target_x = best_w_x - (LANE_WIDTH_PIXELS / 2)
             else:
                 target_x = target_x 
+
             
             # 3. PID
             error = target_x - CENTER_X
             derivative = error - prev_error
             prev_error = error
             steering = (error * Kp) + (derivative * Kd)
+            #target_PREV=target_x
             
 	    # --- DEBUG TEXT OVERLAY ---
             debug_line = (
@@ -238,7 +246,19 @@ def robot_control_loop():
             if delay > 0: delay -= 1
 
             set_drive(BASE_SPEED if best_y_x else SLOW_SPEED, steering if delay < 1 else 0)
-    
+
+            debug_y = int(CAMERA_HEIGHT * ROI_VERTICAL_CUTOFF) + 20
+            cv2.circle(annotated_frame, (int(target_x), debug_y), 10, (0, 255, 0), -1)
+
+            # Draw Center Line
+            cv2.line(annotated_frame, (int(CENTER_X), 0), (int(CENTER_X), CAMERA_HEIGHT), (255, 255, 255), 1)
+            cv2.imshow("yolo", annotated_frame)
+            key = cv2.waitKey(1)
+            if key == 27:
+                cv2.destroyWindow("yolo")
+                raise KeyboardInterrupt
+            
+
     except KeyboardInterrupt:
         print()
         print("Keyboard Interupted")
@@ -304,4 +324,4 @@ if __name__ == "__main__":
                 }
                 json.dump(js, fi)
         except ValueError:
-            print("Invalid Value")
+            print("Invalid Value:")

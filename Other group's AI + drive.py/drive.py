@@ -1,4 +1,3 @@
-
 import cv2
 import time
 import board
@@ -7,9 +6,10 @@ import threading
 from flask import Flask, Response, render_template_string
 from adafruit_pca9685 import PCA9685
 from ultralytics import YOLO
+from pynput import keyboard #NEW IMPORT
 
 # --- CONFIGURATION ---
-MODEL_PATH = './model2.onnx'
+MODEL_PATH = './best_rknn_model'
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CENTER_X = CAMERA_WIDTH / 2
@@ -19,27 +19,51 @@ HOST_IP = '0.0.0.0'
 HOST_PORT = 5000
 
 # --- TUNING ---
-ROI_VERTICAL_CUTOFF = 0.60
-Kp = .00069
-Kd = .0008
-BASE_SPEED = 0.18
-LANE_WIDTH_PIXELS = 450
+ROI_VERTICAL_CUTOFF = 0.65
+Kp = 0.0007
+Kd = 0.0009
+BASE_SPEED = 0.18 #was 0.08
+LANE_WIDTH_PIXELS = 450 
 
 # STOP SIGN LOGIC
-STOP_DURATION = 2.0
+STOP_DURATION = 0.0 #Was 2 changed so that it wont stop       
 STOP_COOLDOWN = 5.0
 STOP_THRESHOLD_Y = CAMERA_HEIGHT * 0.8
 
 # MOTOR PHYSICS
 MIN_MOTOR_POWER = 0.07
-MAX_STEER = 0.6
+MAX_STEER = 0.7
 
 # --- GLOBAL VARIABLES FOR STREAMING ---
 output_frame = None
 lock = threading.Lock()
+ROBOT_ACTIVE = True # <--- NEW: Logic state flag
 
 # --- FLASK APP ---
 app = Flask(__name__)
+
+# --- KEYBOARD LOGIC --- checking stop and resume 
+def on_press(key):
+    global ROBOT_ACTIVE
+    try:
+        # Press 'q' to STOP (Quit/Stop)
+        if key.char == 'q':
+            ROBOT_ACTIVE = False
+            print("\n[!!!] EMERGENCY STOP: MOTORS OFF")
+        
+        # Press 's' to START (Start/Go)
+        if key.char == 's':
+            ROBOT_ACTIVE = True
+            print("\n[>>>] SYSTEM ACTIVE: MOTORS RESUMED")
+            
+    except AttributeError:
+        pass
+
+def start_key_listener(): # Runs in the background to watch for hotkeys
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+
+
 
 # --- Motor Class ---
 class Motor:
@@ -71,15 +95,15 @@ class Motor:
 
 # --- ROBOT LOGIC THREAD ---
 def robot_control_loop():
-    global output_frame, lock
+    global output_frame, lock, ROBOT_ACTIVE # <--- ADDED ROBOT_ACTIVE
     
     # 1. Init Hardware
     try:
         i2c = busio.I2C(board.SCL, board.SDA)
         pca = PCA9685(i2c)
         pca.frequency = 100
-        left_motors = [Motor(pca, 5, 4), Motor(pca, 7, 6)]
-        right_motors = [Motor(pca, 3, 2), Motor(pca, 1, 0)]
+        left_motors = [Motor(pca, 7, 6), Motor(pca, 5, 4)]
+        right_motors = [Motor(pca, 0, 1), Motor(pca, 2, 3)]
     except Exception as e:
         print(f"Hardware Init Error: {e}")
         return
@@ -121,16 +145,29 @@ def robot_control_loop():
             raise RuntimeError("Cannot open camera (VideoCapture(0) failed)")
 
         while True:
+            # 1. NEW: Check if we are in idle mode
+            if not ROBOT_ACTIVE:
+                stop_all() # Ensure wheels are stopped
+                # (Optional) Grab frame anyway to keep the stream alive
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.flip(frame, 1)
+                    cv2.putText(frame, "IDLE MODE - MOTORS OFF", (150, 240), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
+                    with lock:
+                        output_frame = frame.copy()
+                time.sleep(0.1)
+                continue # Skip the rest of the PID/Inference logic
+            #END OF NEW CONDITION
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
 
             # Flip BEFORE YOLO inference (fix mirrored webcam)
             frame = cv2.flip(frame, 1)
-            #frame = frame[64:576, :]
 
             # Run inference on the flipped frame
-            results = model.predict(source=frame, conf=0.5, imgsz=640, verbose=False)
+            results = model.predict(source=frame, conf=0.1, imgsz=640, verbose=False) #was conf=0.5
             result = results[0]
             boxes = result.boxes
             
@@ -143,8 +180,6 @@ def robot_control_loop():
             
             current_time = time.time()
             
-            yellow_line = False
-
             for box in boxes:
                 cls = model.names[int(box.cls[0])]
                 x, y, w, h = box.xywh[0].tolist()
@@ -153,7 +188,7 @@ def robot_control_loop():
                 if cls == 'redline':
                     if y > STOP_THRESHOLD_Y:
                         if (current_time - last_stop_time) > STOP_COOLDOWN:
-                            stop_requested = True
+                            stop_requested = False #Also changed was True
                 
                 # Lane Check (Turn Later Logic)
                 cutoff_pixel = CAMERA_HEIGHT * ROI_VERTICAL_CUTOFF
@@ -164,7 +199,6 @@ def robot_control_loop():
                 if cls == 'yellowline' and area > max_y_area:
                     max_y_area = area
                     best_y_x = x
-                    yellow_line = True
                 elif cls == 'whiteline' and area > max_w_area:
                     max_w_area = area
                     best_w_x = x
@@ -228,7 +262,7 @@ def robot_control_loop():
                 cv2.putText(annotated_frame, line, (x0, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)	
 
-            set_drive(BASE_SPEED / 1 if yellow_line else 2, steering)
+            set_drive(BASE_SPEED, steering)
 
             # --- VISUAL DEBUGGING ON VIDEO ---
             # Draw a Green Circle at the calculated Target X
@@ -242,9 +276,7 @@ def robot_control_loop():
             # Update global frame
             with lock:
                 output_frame = annotated_frame.copy()
-    except KeyboardInterrupt:
-        stop_all()
-        print("KEYBOARD INTERUPT RECEIVED")
+
     except Exception as e:
         print(f"Robot Loop Error: {e}")
     finally:
@@ -297,15 +329,17 @@ def video_feed():
 
 # --- MAIN ENTRY POINT ---
 if __name__ == "__main__":
-    # 1. Start Robot Logic in a Background Thread
-    # daemon=True means this thread dies automatically if the main program quits
+    # 1. Start the Hotkey Listener NEW
+    start_key_listener()
+    
+    # 2. Start Robot Logic
     t = threading.Thread(target=robot_control_loop, daemon=True)
     t.start()
     
-    # 2. Start Flask Server in Main Thread
+    # 3. Start Flask
     print(f"Starting Web Server at http://{HOST_IP}:{HOST_PORT}")
+    print("Hotkeys: [Ctrl+S] to STOP motors | [Ctrl+R] to START motors")
     try:
         app.run(host=HOST_IP, port=HOST_PORT, debug=False, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
-        print("This Actually Ran")
         print("Stopping...")
